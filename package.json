@@ -1,0 +1,13 @@
+{
+  "name": "vreactions-plugins",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "valenced-plugin build",
+    "serve": "valenced-plugin serve"
+  },
+  "dependencies": {
+    "@valenced/plugin-cli": "git+https://github.com/Valenced/valenced-plugin-cli.git",
+    "@valenced/types": "git+https://github.com/Valenced/valenced-types.git"
+  }
+}
