@@ -1,0 +1,16 @@
+{
+    "format": 1,
+    "id": "dev.k0nkx.vreactions",
+    "name": "VReactions",
+    "description": "Reaction spam presets, chat commands, and long-press menu buttons. Stops on a 429.",
+    "author": "@fqxk on discord",
+    "version": "1.0.0",
+    "icon": "ic_add_reaction_24px",
+    "dependencies": {
+        "valenced.api": { "version": ">=1 <2" },
+        "discord": { "version": "*" }
+    },
+    "dist": {
+        "script": "index.js"
+    }
+}
