@@ -469,4 +469,456 @@ export default plugin<{ jsonStorage: Settings }>({
             } catch { return id }
         }
 
-        async function runWithStatus(channelId: st
+        async function runWithStatus(channelId: string, shownText: string, job: (skipId?: string) => Promise<string>) {
+            let sentId: string | undefined
+            try {
+                const res = await RestAPI.post({
+                    url: `/channels/${channelId}/messages`,
+                    body: { content: shownText },
+                })
+                sentId = res?.body?.id
+            } catch (e) {
+                logger.error('Reaction Spam: could not post status message', e)
+            }
+            let result = 'failed'
+            try {
+                result = await job(sentId)
+            } catch (e) {
+                logger.error('Reaction Spam: command job failed', e)
+            }
+            if (sentId) {
+                try {
+                    await RestAPI.patch?.({ url: `/channels/${channelId}/messages/${sentId}`, body: { content: result } })
+                        ?? RestAPI.put?.({ url: `/channels/${channelId}/messages/${sentId}`, body: { content: result } })
+                    await sleep(2000)
+                    await (RestAPI.del ?? RestAPI.delete).call(RestAPI, { url: `/channels/${channelId}/messages/${sentId}` })
+                } catch (e) {
+                    logger.error('Reaction Spam: could not update/delete status message', e)
+                }
+            }
+        }
+
+        function censorWordList() {
+            return String(storage.censorWords ?? DEFAULT_CENSOR).split(/\s+/).filter(Boolean)
+        }
+
+        function censorText(text: string) {
+            const words = censorWordList().sort((a, b) => b.length - a.length)
+            if (!words.length) return text
+            const escape = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            let out = text
+            for (const w of words) {
+                const re = new RegExp(escape(w), 'gi')
+                out = out.replace(re, m => m.replace(/o/gi, '█'))
+            }
+            return out
+        }
+
+        function handleCommand(channelId: string, content: string) {
+            const prefix = storage.prefix || ';'
+            if (typeof content !== 'string' || !content.startsWith(prefix)) return false
+            const body = content.slice(prefix.length)
+
+            const undoUser = body.match(/^\s*undo\s+<@!?(\d+)>\s*$/i)
+            const undoCount = body.match(/^\s*undo(?:\s+(\d{1,3}))?\s*$/i)
+            const meCmd = body.match(/^\s*me\s+(\d{1,3})(?:\s+(silent|normal))?\s*$/i)
+            const censorCmd = body.match(/^\s*(un)?censor\s*$/i)
+            const spamCmd = body.match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/)
+            const spamIdCmd = body.match(/^\s*([\w -]+?)\s+(\d{15,22})\s*$/)
+
+            let job: ((skipId?: string) => Promise<string>) | null = null
+
+            if (undoUser) {
+                const userId = undoUser[1]
+                job = async skipId => {
+                    const msgs = await fetchRecent(channelId, 50, skipId)
+                    const target = msgs.find((m: any) => m?.author?.id === userId && (m.reactions ?? []).some((r: any) => r?.me))
+                    if (!target) return 'nothing to undo'
+                    const removed = await removeMyReactions([target], channelId)
+                    jsonStorage.set({ lastRun: `undo @${userName(userId)}: removed ${removed} reaction(s)` })
+                    return removed > 0 ? 'finished' : 'failed'
+                }
+            } else if (undoCount) {
+                const n = Math.min(100, Math.max(1, parseInt(undoCount[1], 10) || 1))
+                job = async skipId => {
+                    const msgs = (await fetchRecent(channelId, n, skipId)).slice(0, n)
+                    const mine = msgs.filter((m: any) => (m?.reactions ?? []).some((r: any) => r?.me))
+                    if (!mine.length) return 'nothing to undo'
+                    const removed = await removeMyReactions(mine, channelId)
+                    jsonStorage.set({ lastRun: `undo ${n}: removed ${removed} reaction(s) from ${mine.length} message(s)` })
+                    return removed > 0 ? 'finished' : 'failed'
+                }
+            } else if (spamCmd) {
+                const [, query, userId] = spamCmd
+                job = async skipId => {
+                    const preset = findClosestPreset(query)
+                    if (!preset) {
+                        jsonStorage.set({ lastRun: `Command "${query.trim()}": no preset with a similar name` })
+                        return 'no matching preset'
+                    }
+                    const target = await findLatestMessage(channelId, userId, skipId)
+                    if (!target) {
+                        jsonStorage.set({ lastRun: `${preset.name}: couldn't find a recent message from that person` })
+                        return 'no recent message found'
+                    }
+                    const result = await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset)
+                    return result && result.sent > 0 ? 'finished' : 'failed'
+                }
+            } else if (spamIdCmd) {
+                const [, query, messageId] = spamIdCmd
+                job = async () => {
+                    const preset = findClosestPreset(query)
+                    if (!preset) {
+                        jsonStorage.set({ lastRun: `Command "${query.trim()}": no preset with a similar name` })
+                        return 'no matching preset'
+                    }
+                    const targetChannel = await locateMessageChannel(channelId, messageId)
+                    if (!targetChannel) {
+                        jsonStorage.set({ lastRun: `${preset.name}: couldn't find message ${messageId} in this server` })
+                        return 'message not found'
+                    }
+                    const result = await spam({ id: messageId, channel_id: targetChannel }, preset)
+                    return result && result.sent > 0 ? 'finished' : 'failed'
+                }
+            } else if (meCmd) {
+                const n = Math.min(500, Math.max(1, parseInt(meCmd[1], 10) || 1))
+                const mode = (meCmd[2] || (storage.silentDelete ? 'silent' : 'normal')).toLowerCase()
+                job = skipId => purgeMine(channelId, n, mode, skipId)
+            } else if (censorCmd) {
+                const on = !censorCmd[1]
+                jsonStorage.set({ censor: on })
+                showToast(on ? 'Censor on' : 'Censor off')
+                return true
+            } else {
+                return false
+            }
+
+            const shown = content.replace(/<@!?(\d+)>/g, (_, id) => '@' + userName(id))
+            runWithStatus(channelId, shown, job!)
+            return true
+        }
+
+        async function collectMyMessages(channelId: string, n: number, startBefore?: string) {
+            const out: any[] = []
+            let before = startBefore
+            const me = Stores.UserStore?.getCurrentUser?.()?.id
+            while (out.length < n) {
+                const batch = await fetchRecent(channelId, Math.min(100, n - out.length + 5), before)
+                if (!batch.length) break
+                for (const m of batch) {
+                    if (m?.author?.id === me) out.push(m)
+                    if (out.length >= n) break
+                }
+                before = batch[batch.length - 1]?.id
+                if (!before) break
+            }
+            return out.slice(0, n)
+        }
+
+        const deleteMessage = (channelId: string, messageId: string) =>
+            (RestAPI.del ?? RestAPI.delete).call(RestAPI, { url: `/channels/${channelId}/messages/${messageId}` })
+
+        async function silentDeleteMessage(channelId: string, messageId: string) {
+            try {
+                await withRetry(() => RestAPI.post({
+                    url: `/channels/${channelId}/messages`,
+                    body: { content: '\u200b', message_reference: { message_id: messageId, channel_id: channelId } },
+                }))
+            } catch {}
+            await sleep(1500)
+            await deleteMessage(channelId, messageId)
+        }
+
+        async function purgeMine(channelId: string, n: number, mode: string, skipId?: string) {
+            const msgs = await collectMyMessages(channelId, n, skipId)
+            let deleted = 0
+            for (const m of msgs) {
+                try {
+                    if (mode === 'silent') await silentDeleteMessage(channelId, m.id)
+                    else await deleteMessage(channelId, m.id)
+                    deleted++
+                    const delay = Math.max(0, parseInt(storage.delay, 10) || 0)
+                    if (delay) await sleep(delay)
+                } catch (e) {
+                    logger.error('Reaction Spam: purge failed', e)
+                }
+            }
+            jsonStorage.set({ lastRun: `me ${n} ${mode}: deleted ${deleted}/${msgs.length}` })
+            return deleted > 0 ? 'finished' : 'failed'
+        }
+
+        // ---- Patch send (commands + censor) --------------------------------
+
+        function patchSend() {
+            const [MessageActions] = lookupModule(withProps('sendMessage', 'editMessage'))
+            if (!MessageActions?.sendMessage) {
+                logger.error('Reaction Spam: could not find MessageActions')
+                return
+            }
+            cleanup(
+                before(MessageActions, 'sendMessage', (args: any[]) => {
+                    const channelId = args[0]
+                    const msg = args[1]
+                    if (!msg || typeof msg.content !== 'string') return args
+                    if (handleCommand(channelId, msg.content)) {
+                        // swallow the original send
+                        args[1] = { ...msg, content: '' }
+                        // still let it through but empty; better to instead-patch when possible
+                        return args
+                    }
+                    if (storage.censor) {
+                        msg.content = censorText(msg.content)
+                    }
+                    return args
+                }),
+            )
+            // Stronger intercept: instead of sending empty, block command messages
+            cleanup(
+                instead(MessageActions, 'sendMessage', (args: any[], original: Function) => {
+                    const channelId = args[0]
+                    const msg = args[1]
+                    if (msg && typeof msg.content === 'string' && handleCommand(channelId, msg.content)) {
+                        return Promise.resolve({ ok: true })
+                    }
+                    if (msg && storage.censor && typeof msg.content === 'string') {
+                        msg.content = censorText(msg.content)
+                    }
+                    return original(...args)
+                }),
+            )
+        }
+
+        // ---- Toast guard (same reason as original) -------------------------
+
+        function patchToastGuard() {
+            try {
+                const [store] = lookupModule(withProps('open', 'close', 'getToasts'))
+                const fn = store?.open ? 'open' : store?.openToast ? 'openToast' : null
+                if (store && fn) {
+                    cleanup(
+                        instead(store, fn, (args: any[], orig: Function) => {
+                            const t = args?.[0]
+                            if (t && typeof t === 'object' && (t.position ?? t.options?.position) === undefined) return
+                            return orig(...args)
+                        }),
+                    )
+                }
+            } catch (e) {
+                logger.error('Reaction Spam: could not guard toasts', e)
+            }
+        }
+
+        // ---- Long-press menu -----------------------------------------------
+
+        const isRow = (el: any) => el?.props && typeof el.props.label === 'string' && typeof el.props.onPress === 'function'
+
+        function makeRow(template: any, key: string, label: string, iconNames: string[], onPress: () => void) {
+            const props: any = { key, label, onPress }
+            const iconId = iconNames.map(n => getAssetIdByName?.(n)).find(Boolean)
+            const icon = template.props.icon
+            if (iconId && React.isValidElement(icon)) props.icon = React.cloneElement(icon, { source: iconId })
+            else if (iconId && typeof icon === 'number') props.icon = iconId
+            return React.cloneElement(template, props)
+        }
+
+        function addRow(tree: any, message: any) {
+            const rows = findInReactTree(tree, (x: any) => Array.isArray(x) && x.some(isRow))
+            if (!rows) return
+            for (let i = rows.length - 1; i >= 0; i--) {
+                if (typeof rows[i]?.key === 'string' && rows[i].key.startsWith('reaction-spam')) rows.splice(i, 1)
+            }
+            const template = rows.find(isRow)
+            if (!template) return
+            const icons = ['ic_add_reaction_24px', 'ReactionIcon', 'EmojiNewIcon', 'ic_emoji_24px']
+            const hide = () => ActionSheet?.hideActionSheet?.()
+
+            if (running) {
+                rows.push(makeRow(template, 'reaction-spam-stop', 'Stop Reaction Spam', icons, () => {
+                    hide()
+                    cancelled = true
+                    showToast('Stopping...')
+                }))
+                return
+            }
+
+            ;(storage.presets ?? []).map(plain).forEach((snap, i) => {
+                rows.push(makeRow(template, `reaction-spam-${i}-${snap.id}`, snap.name || 'Spam Reactions', icons, () => {
+                    hide()
+                    const live = storage.presets?.[i]
+                    spam(message, live ? plain(live) : snap)
+                }))
+            })
+        }
+
+        function patchSheet() {
+            if (!ActionSheet) {
+                logger.error('Reaction Spam: could not find action sheet module')
+                return
+            }
+            cleanup(
+                before(ActionSheet, 'openLazy', (args: any[]) => {
+                    const [lazy, key] = args
+                    if (typeof key !== 'string' || !key.includes('MessageLongPress')) return args
+                    Promise.resolve(lazy).then((mod: any) => {
+                        if (!mod) return
+                        const target = typeof mod.default === 'function' ? mod
+                            : typeof mod.default?.type === 'function' ? mod.default : null
+                        const prop = typeof mod.default === 'function' ? 'default'
+                            : typeof mod.default?.type === 'function' ? 'type' : null
+                        if (!target || !prop) {
+                            logger.error('Reaction Spam: unexpected message menu shape')
+                            return
+                        }
+                        cleanup(
+                            after(target, prop, (args: any[], tree: any) => {
+                                try {
+                                    if (args?.[0]?.message?.id) addRow(tree, args[0].message)
+                                } catch (e) {
+                                    logger.error('Reaction Spam: could not add menu button', e)
+                                }
+                                return tree
+                            }),
+                        )
+                    })
+                    return args
+                }),
+            )
+        }
+
+        patchToastGuard()
+        patchSheet()
+        patchSend()
+
+        logger.log('VReactions started')
+    },
+
+    SettingsComponent({ api }) {
+        const { Text, TextInput, View, Switch, TouchableOpacity, ScrollView } = ReactNative as any
+        const settings = api.jsonStorage.use() as Settings | undefined
+        if (!settings) return null
+
+        const label = { color: '#ffffff', fontSize: 16, fontWeight: '600' as const, marginBottom: 6 }
+        const hint = { color: '#b5bac1', fontSize: 13, marginTop: 6 }
+        const input = {
+            color: '#ffffff',
+            backgroundColor: '#1e1f22',
+            borderRadius: 8,
+            paddingHorizontal: 12,
+            paddingVertical: 10,
+            fontSize: 16,
+        }
+        const card = { backgroundColor: '#2b2d31', borderRadius: 12, padding: 14, gap: 12, marginBottom: 12 }
+
+        const presets = (Array.isArray(settings.presets) ? settings.presets : []).map(plain)
+        const update = (i: number, patch: Partial<Preset>) => {
+            const next = presets.map((p, j) => j === i ? { ...p, ...patch } : p)
+            api.jsonStorage.set({ presets: next })
+        }
+        const remove = (i: number) => {
+            api.jsonStorage.set({ presets: presets.filter((_, j) => j !== i) })
+        }
+        const add = () => {
+            api.jsonStorage.set({
+                presets: [...presets, { id: newId(), name: 'New preset', emojis: '' }],
+            })
+        }
+
+        const button = (text: string, onPress: () => void, color: string) =>
+            React.createElement(TouchableOpacity, {
+                onPress,
+                style: { backgroundColor: color, borderRadius: 8, paddingVertical: 10, alignItems: 'center', marginVertical: 4 },
+            }, React.createElement(Text, { style: { color: '#ffffff', fontWeight: '600', fontSize: 15 } }, text))
+
+        const presetCards = presets.map((p, i) =>
+            React.createElement(View, { key: `${i}-${p.id}`, style: card },
+                React.createElement(View, null,
+                    React.createElement(Text, { style: label }, 'Button name'),
+                    React.createElement(TextInput, {
+                        style: input,
+                        value: p.name ?? '',
+                        placeholder: 'e.g. Flame Skull',
+                        placeholderTextColor: '#80848e',
+                        onChangeText: (v: string) => update(i, { name: v }),
+                    }),
+                ),
+                React.createElement(View, null,
+                    React.createElement(Text, { style: label }, 'Emojis (max 20)'),
+                    React.createElement(TextInput, {
+                        style: { ...input, minHeight: 80, textAlignVertical: 'top' },
+                        multiline: true,
+                        value: p.emojis ?? '',
+                        placeholder: '😂 💀 🔥  or  :skullcry:  or  <:name:id>',
+                        placeholderTextColor: '#80848e',
+                        onChangeText: (v: string) => update(i, { emojis: v }),
+                    }),
+                ),
+                button('Remove', () => remove(i), '#ed4245'),
+            ),
+        )
+
+        return React.createElement(ScrollView, { style: { padding: 16 }, contentContainerStyle: { gap: 16 } },
+            React.createElement(View, null,
+                React.createElement(Text, { style: label }, 'Command prefix'),
+                React.createElement(TextInput, {
+                    style: input,
+                    value: settings.prefix ?? ';',
+                    placeholder: ';',
+                    placeholderTextColor: '#80848e',
+                    onChangeText: (v: string) => api.jsonStorage.set({ prefix: v.trim() }),
+                }),
+                React.createElement(Text, { style: hint },
+                    'Commands: ";flame @someone" adds the closest-named preset to their latest message. '
+                    + '";flame 1563682914397323414" targets that message ID in any channel of this server. '
+                    + '";undo 10" / ";undo @someone". ";me 10" deletes your last 10 messages. '
+                    + '";censor" / ";uncensor".'),
+            ),
+            React.createElement(View, null,
+                React.createElement(View, { style: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' } },
+                    React.createElement(Text, { style: { ...label, marginBottom: 0 } }, 'Auto-censor my messages'),
+                    React.createElement(Switch, {
+                        value: !!settings.censor,
+                        onValueChange: (v: boolean) => api.jsonStorage.set({ censor: v }),
+                    }),
+                ),
+                React.createElement(TextInput, {
+                    style: { ...input, marginTop: 10 },
+                    value: settings.censorWords ?? '',
+                    placeholder: DEFAULT_CENSOR,
+                    placeholderTextColor: '#80848e',
+                    onChangeText: (v: string) => api.jsonStorage.set({ censorWords: v }),
+                }),
+                React.createElement(Text, { style: hint },
+                    'Words to censor, separated by spaces. Each "o" becomes █.'),
+            ),
+            React.createElement(View, null,
+                React.createElement(View, { style: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' } },
+                    React.createElement(Text, { style: { ...label, marginBottom: 0 } }, 'Silent delete for ;me'),
+                    React.createElement(Switch, {
+                        value: !!settings.silentDelete,
+                        onValueChange: (v: boolean) => api.jsonStorage.set({ silentDelete: v }),
+                    }),
+                ),
+                React.createElement(Text, { style: hint },
+                    'On = silent delete (placeholder then delete). Override with ";me 10 silent" or ";me 10 normal".'),
+            ),
+            ...presetCards,
+            button('+ Add a new button', add, '#5865f2'),
+            React.createElement(View, null,
+                React.createElement(Text, { style: label }, 'Delay between reactions (ms)'),
+                React.createElement(TextInput, {
+                    style: input,
+                    value: String(settings.delay ?? ''),
+                    placeholder: '400',
+                    placeholderTextColor: '#80848e',
+                    keyboardType: 'numeric',
+                    onChangeText: (v: string) => api.jsonStorage.set({ delay: v.replace(/[^0-9]/g, '') }),
+                }),
+                React.createElement(Text, { style: hint },
+                    'Stops immediately on a 429. Raise the delay if you keep hitting it.'),
+            ),
+            settings.lastRun
+                ? React.createElement(Text, { style: hint }, 'Last run: ' + settings.lastRun)
+                : null,
+        )
+    },
+})
